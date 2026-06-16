@@ -1,0 +1,22 @@
+{
+  "color_space": "HSV",
+  "lower": [
+    0,
+    150,
+    130
+  ],
+  "upper": [
+    20,
+    255,
+    255
+  ],
+  "used_images": 560,
+  "skipped_images": 20,
+  "source_label_dirs": [
+    "/Users/sasakiryouga/ws/ssl-YOLO-detection/Orange Balls/train/labels",
+    "/Users/sasakiryouga/ws/ssl-YOLO-detection/Orange Balls/train_augmented/labels"
+  ],
+  "lower_percentile": 4.0,
+  "upper_percentile": 96.0,
+  "note": "肌色誤検知対策のため lower の S/V を手動調整 (元: lower=[0,121,103])"
+}
