@@ -1,178 +1,104 @@
+"""
+オレンジボール検出スクリプト。
+
+train_orange_ball.py で生成された last.pt (または best.pt) を使って
+カメラ・動画・静止画からオレンジボールを検出する。
+
+使い方:
+    python BallDetect.py                          # カメラ0 + last.pt
+    python BallDetect.py --model best.pt          # best.pt を使う
+    python BallDetect.py --source video.mp4       # 動画ファイル
+    python BallDetect.py --source image.jpg       # 静止画
+"""
+
 from argparse import ArgumentParser
 from pathlib import Path
-import json
 
 import cv2
-import numpy as np
+from ultralytics import YOLO
 
 
+# ─── パス設定 ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent
-DEFAULT_MODEL = ROOT / "orange_ball_color_model.json"
+
+# スクリプトと同じディレクトリの last.pt を優先、なければ best.pt にフォールバック
+def _default_model() -> Path:
+    for name in ("last.pt", "best.pt"):
+        p = ROOT / name
+        if p.exists():
+            return p
+    return ROOT / "last.pt"   # 存在しない場合はエラーメッセージで案内
 
 
+# ─── 引数 ────────────────────────────────────────────────────────────────────
 def parse_args():
-    parser = ArgumentParser(description="Detect orange balls with an OpenCV color model.")
-    parser.add_argument("--model", default=str(DEFAULT_MODEL))
-    parser.add_argument("--source", default="0",
-                        help="Camera index, image path, or video path. Default: 0")
-    parser.add_argument("--min-area", type=int, default=300,
-                        help="Minimum contour area to draw. Default: 300")
-    parser.add_argument("--min-circularity", type=float, default=0.35,
-                        help="Minimum circularity (0-1). Default: 0.35")
-    parser.add_argument("--iou-merge", type=float, default=0.3,
-                        help="IoU threshold for merging overlapping detections. Default: 0.3")
-    parser.add_argument("--log-interval", type=int, default=10,
-                        help="Log every N frames. 0 = disable. Default: 10")
+    parser = ArgumentParser(description="Detect orange balls with a YOLO .pt model.")
+    parser.add_argument(
+        "--model",
+        default=str(_default_model()),
+        help="Path to YOLO .pt model. Default: last.pt (same directory as this script)",
+    )
+    parser.add_argument(
+        "--source",
+        default="0",
+        help="Camera index (0,1,...), image path, or video path. Default: 0",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.25,
+        help="Confidence threshold. Default: 0.25",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Log every N frames (0 = no log). Default: 10",
+    )
     return parser.parse_args()
 
 
-def normalize_source(source):
+# ─── ユーティリティ ──────────────────────────────────────────────────────────
+
+def normalize_source(source: str):
+    """数字文字列はカメラインデックス（int）に変換する。"""
     return int(source) if source.isdigit() else source
 
 
-def load_color_model(path):
-    model_path = Path(path)
-    if not model_path.exists():
-        print(f"Color model not found: {model_path}")
-        print("Please run first: python3 train_orange_ball.py")
-        return None
-    model = json.loads(model_path.read_text(encoding="utf-8"))
-    lower = np.array(model["lower"], dtype=np.uint8)
-    upper = np.array(model["upper"], dtype=np.uint8)
-    return lower, upper
-
-
-def circle_iou(c1, c2):
-    """Approximate IoU for two circles (cx, cy, r)."""
-    cx1, cy1, r1 = c1
-    cx2, cy2, r2 = c2
-    dist = np.hypot(cx1 - cx2, cy1 - cy2)
-    if dist >= r1 + r2:
-        return 0.0
-    if dist <= abs(r1 - r2):
-        smaller_area = np.pi * min(r1, r2) ** 2
-        union = np.pi * max(r1, r2) ** 2
-        return smaller_area / union
-    a = (r1**2 * np.arccos((dist**2 + r1**2 - r2**2) / (2 * dist * r1))
-         + r2**2 * np.arccos((dist**2 + r2**2 - r1**2) / (2 * dist * r2))
-         - 0.5 * np.sqrt((-dist + r1 + r2) * (dist + r1 - r2) * (dist - r1 + r2) * (dist + r1 + r2)))
-    union = np.pi * (r1**2 + r2**2) - a
-    return a / union if union > 0 else 0.0
-
-
-def merge_overlapping_circles(circles, iou_threshold):
-    """Merge circles whose IoU exceeds the threshold, keeping the largest."""
-    if not circles:
-        return []
-    circles = sorted(circles, key=lambda c: c[3], reverse=True)
-    kept = []
-    suppressed = [False] * len(circles)
-    for i, ci in enumerate(circles):
-        if suppressed[i]:
-            continue
-        kept.append(ci)
-        for j in range(i + 1, len(circles)):
-            if suppressed[j]:
-                continue
-            if circle_iou(ci[:3], circles[j][:3]) >= iou_threshold:
-                suppressed[j] = True
-    return kept
-
-
-def detect_orange_balls(frame, lower, upper, min_area, min_circularity, iou_merge):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, lower, upper)
-
-    kernel_close = np.ones((15, 15), dtype=np.uint8)
-    kernel_open  = np.ones((5,  5),  dtype=np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
-
-    frame_height, frame_width = mask.shape[:2]
-    edge_margin = 2
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < min_area:
-            continue
-
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter == 0:
-            continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        touches_edge = (
-            x <= edge_margin
-            or y <= edge_margin
-            or x + w >= frame_width  - edge_margin
-            or y + h >= frame_height - edge_margin
-        )
-        eff_circ = min_circularity * 0.5 if touches_edge else min_circularity
-
-        circularity = 4 * np.pi * area / (perimeter ** 2)
-        if circularity < eff_circ:
-            continue
-
-        (cx, cy), radius = cv2.minEnclosingCircle(contour)
-        cx, cy, radius = int(cx), int(cy), int(radius)
-
-        candidates.append((cx, cy, radius, area, circularity))
-
-    detections = merge_overlapping_circles(candidates, iou_merge)
-    return detections, mask
-
-
-def log_detections(frame_no, detections):
-    """Print detection results to the terminal."""
-    timestamp = f"[frame {frame_no:06d}]"
-    if not detections:
-        print(f"{timestamp} no detection")
+def log_detections(frame_no: int, boxes) -> None:
+    ts = f"[frame {frame_no:06d}]"
+    if len(boxes) == 0:
+        print(f"{ts} no detection")
         return
-    print(f"{timestamp} detected: {len(detections)}")
-    for i, (cx, cy, radius, area, circularity) in enumerate(detections, 1):
-        print(
-            f"  [{i}] center=({cx:4d}, {cy:4d})  radius={radius:4d}px"
-            f"  area={area:8.0f}px2  circularity={circularity:.3f}"
-        )
+    print(f"{ts} detected: {len(boxes)}")
+    for i, box in enumerate(boxes, 1):
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        conf = float(box.conf[0])
+        cls  = int(box.cls[0])
+        print(f"  [{i}] bbox=[{x1}, {y1}, {x2}, {y2}]  conf={conf:.3f}  class={cls}")
 
 
-def draw_detections(frame, detections):
-    color = (255, 100, 0)  # blue (BGR)
-
-    for cx, cy, radius, area, circularity in detections:
-        cv2.circle(frame, (cx, cy), radius, color, 2)
-        label = f"orange ball  r={radius}  circ={circularity:.2f}"
-        cv2.putText(
-            frame,
-            label,
-            (cx - radius, max(20, cy - radius - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-        )
-
+# ─── メイン ──────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
-    color_model = load_color_model(args.model)
-    if color_model is None:
+
+    model_path = Path(args.model)
+    if not model_path.exists():
+        print(f"[ERROR] モデルが見つかりません: {model_path}")
+        print("  先に train_orange_ball.py を実行して last.pt を生成してください。")
         return
 
-    lower, upper = color_model
-    cap = cv2.VideoCapture(normalize_source(args.source))
+    print(f"Loading YOLO model: {model_path}")
+    model = YOLO(str(model_path))
 
+    source = normalize_source(args.source)
+    cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        print(f"Failed to open source: {args.source}")
+        print(f"[ERROR] ソースを開けませんでした: {args.source}")
         return
 
-    print("Orange ball detection started. Press 'q' to quit, 'm' to toggle mask view.")
-    show_mask = False
-    mask_window_open = False
+    print("Orange ball detection started. Press 'q' to quit.")
     frame_no = 0
 
     while True:
@@ -180,30 +106,18 @@ def main():
         if not ret:
             break
 
-        detections, mask = detect_orange_balls(
-            frame, lower, upper,
-            args.min_area, args.min_circularity, args.iou_merge
-        )
-        draw_detections(frame, detections)
+        results = model(frame, conf=args.conf, verbose=False)
+        boxes   = results[0].boxes
+        annotated_frame = results[0].plot()
 
         if args.log_interval > 0 and frame_no % args.log_interval == 0:
-            log_detections(frame_no, detections)
+            log_detections(frame_no, boxes)
 
         frame_no += 1
 
-        cv2.imshow("Orange Ball Detection", frame)
-        if show_mask:
-            cv2.imshow("Orange Ball Mask", mask)
-            mask_window_open = True
-        elif mask_window_open:
-            cv2.destroyWindow("Orange Ball Mask")
-            mask_window_open = False
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        cv2.imshow("Orange Ball Detection (YOLO)", annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
-        if key == ord("m"):
-            show_mask = not show_mask
 
     cap.release()
     cv2.destroyAllWindows()
